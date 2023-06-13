@@ -14,7 +14,7 @@ x9_profiler.c
 ```
 
 `x9_profiler.c` allows to test the performance of the library given different
-parameters, such asthe _inbox size_, _message size_ and in which _cpu cores_
+parameters, such as the _inbox size_, _message size_ and in which _cpu cores_
 the test is performed.  
 It does so by having the producer/writer write _N messages_ to the _inbox_ and
 the consumer/reader read them.  
@@ -23,7 +23,7 @@ line arguments, as shown below.
 
 Additionally, two different types of tests can be run:
 - **--test 1** should be used to get an idea of the raw performance of the 
-- library since it calls `x9_write_to_inbox_spin` and `x9_read_from_inbox_spin` 
+library since it calls `x9_write_to_inbox_spin` and `x9_read_from_inbox_spin` 
 in the background, which is ideal for low latency systems.
 - **--test 2** uses the non spinning version of the functions above, and while
 it will be slower, it allows to understand the _hit ratio_ of
