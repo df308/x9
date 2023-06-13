@@ -80,7 +80,7 @@ Example (test 2):
 $ ./X9_PROF \
   --test 2 \
   --inboxes_szs 1024,2048,4096 \
-  --msgs_szs 16,32,64 \
+  --msgs_szs 16,32,64,128 \
   --n_msgs 100000000 \
   --n_its 1 \
   --run_in_cores 2,4
