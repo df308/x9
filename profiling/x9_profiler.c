@@ -505,7 +505,7 @@ int main(int argc, char** argv) {
             double const median_reader_hit = calculate_median(
                 (uint64_t)config->n_iterations, reader_hit_ratio);
 
-            printf("%*.2f%% | ", 18, median_writer_hit * 100);
+            printf(" |%*.2f%% | ", 16, median_writer_hit * 100);
             printf("%*.2f%%", 15, median_reader_hit * 100);
           }
         }
