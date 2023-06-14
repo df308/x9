@@ -51,12 +51,19 @@ static void x9_print_error_msg(char const* const error_msg) {
 
 /* --- Internal types --- */
 
-typedef struct {
-  _Atomic(bool) slot_has_data;
-  _Atomic(bool) msg_written;
-  _Atomic(bool) shared;
-  char const    pad[5];
+typedef union {
+  /* keep original members, they're not used but helps with code debugging */
+  struct {
+    bool slot_has_data;
+    bool msg_written;
+    bool shared;
+  } s;
+  _Atomic(uint64_t) mask;
 } x9_msg_header;
+
+#define X9_SLOT_HAS_DATA  0x1UL
+#define X9_MSG_WRITTEN    0x100UL
+#define X9_SHARED         0x10000UL
 
 /* CPU cache line size */
 #define X9_CL_SIZE 64
@@ -289,14 +296,18 @@ void x9_free_node_and_attached_inboxes(x9_node* const node) {
 bool x9_write_to_inbox(x9_inbox* const inbox,
                        uint64_t const  msg_sz,
                        void const* restrict const msg) {
-  bool                 f      = false;
   uint64_t const       idx    = x9_load_idx(inbox, false);
   x9_msg_header* const header = x9_header_ptr(inbox, idx);
 
-  if (atomic_compare_exchange_strong(&header->slot_has_data, &f, true)) {
+  /* use a shared access atomic test before writing */
+  uint64_t mask = atomic_load_explicit(&header->mask, __ATOMIC_RELAXED);
+  if (mask & X9_SLOT_HAS_DATA) return false;
+  mask = atomic_fetch_or_explicit(
+      &header->mask, X9_SLOT_HAS_DATA, __ATOMIC_ACQUIRE);
+  if (!(mask & X9_SLOT_HAS_DATA)) {
     memcpy((char*)header + sizeof(x9_msg_header), msg, msg_sz);
-    atomic_fetch_add(&inbox->write_idx, 1);
-    atomic_exchange(&header->msg_written, true);
+    atomic_fetch_or_explicit(&header->mask, X9_MSG_WRITTEN, __ATOMIC_RELEASE);
+    atomic_fetch_add_explicit(&inbox->write_idx, 1, __ATOMIC_RELAXED);
     return true;
   }
   return false;
@@ -306,13 +317,17 @@ void x9_write_to_inbox_spin(x9_inbox* const inbox,
                             uint64_t const  msg_sz,
                             void const* restrict const msg) {
   for (;;) {
-    bool                 f      = false;
     uint64_t const       idx    = x9_increment_idx(inbox, false);
     x9_msg_header* const header = x9_header_ptr(inbox, idx);
 
-    if (atomic_compare_exchange_strong(&header->slot_has_data, &f, true)) {
+    /* use a shared access atomic test before writing */
+    uint64_t mask = atomic_load_explicit(&header->mask, __ATOMIC_RELAXED);
+    if (mask & X9_SLOT_HAS_DATA) continue;
+    mask = atomic_fetch_or_explicit(
+        &header->mask, X9_SLOT_HAS_DATA, __ATOMIC_ACQUIRE);
+    if (!(mask & X9_SLOT_HAS_DATA)) {
       memcpy((char*)header + sizeof(x9_msg_header), msg, msg_sz);
-      atomic_exchange(&header->msg_written, true);
+      atomic_fetch_or_explicit(&header->mask, X9_MSG_WRITTEN, __ATOMIC_RELEASE);
       break;
     }
   }
@@ -332,14 +347,13 @@ bool x9_read_from_inbox(x9_inbox* const inbox,
   uint64_t const       idx    = x9_load_idx(inbox, true);
   x9_msg_header* const header = x9_header_ptr(inbox, idx);
 
-  if (atomic_load(&header->slot_has_data)) {
-    if (atomic_load(&header->msg_written)) {
-      memcpy(outparam, (char*)header + sizeof(x9_msg_header), msg_sz);
-      atomic_exchange(&header->msg_written, false);
-      atomic_exchange(&header->slot_has_data, false);
-      atomic_fetch_add(&inbox->read_idx, 1);
-      return true;
-    }
+  uint64_t mask = atomic_load(&header->mask);
+  uint64_t expected = X9_SLOT_HAS_DATA | X9_MSG_WRITTEN;
+  if ((mask & expected) == expected) {
+    memcpy(outparam, (char*)header + sizeof(x9_msg_header), msg_sz);
+    atomic_store_explicit(&header->mask, 0, __ATOMIC_RELEASE);
+    atomic_fetch_add_explicit(&inbox->read_idx, 1, __ATOMIC_RELAXED);
+    return true;
   }
   return false;
 }
@@ -349,15 +363,14 @@ void x9_read_from_inbox_spin(x9_inbox* const inbox,
                              void* restrict const outparam) {
   uint64_t const       idx    = x9_increment_idx(inbox, true);
   x9_msg_header* const header = x9_header_ptr(inbox, idx);
+  uint64_t expected = X9_SLOT_HAS_DATA | X9_MSG_WRITTEN;
 
   for (;;) {
-    if (atomic_load(&header->slot_has_data)) {
-      if (atomic_load(&header->msg_written)) {
-        memcpy(outparam, (char*)header + sizeof(x9_msg_header), msg_sz);
-        atomic_exchange(&header->msg_written, false);
-        atomic_exchange(&header->slot_has_data, false);
-        return;
-      }
+    uint64_t mask = atomic_load_explicit(&header->mask, __ATOMIC_ACQUIRE);
+    if ((mask & expected) == expected) {
+      memcpy(outparam, (char*)header + sizeof(x9_msg_header), msg_sz);
+      atomic_store_explicit(&header->mask, 0, __ATOMIC_RELEASE);
+      return;
     }
   }
 }
@@ -365,22 +378,25 @@ void x9_read_from_inbox_spin(x9_inbox* const inbox,
 bool x9_read_from_shared_inbox(x9_inbox* const inbox,
                                uint64_t const  msg_sz,
                                void* restrict const outparam) {
-  bool                 f      = false;
   uint64_t const       idx    = x9_load_idx(inbox, true);
   x9_msg_header* const header = x9_header_ptr(inbox, idx);
+  uint64_t expected = X9_SLOT_HAS_DATA | X9_MSG_WRITTEN;
 
-  if (atomic_compare_exchange_strong(&header->shared, &f, true)) {
-    if (atomic_load(&header->slot_has_data)) {
-      if (atomic_load(&header->msg_written)) {
-        memcpy(outparam, (char*)header + sizeof(x9_msg_header), msg_sz);
-        atomic_fetch_add(&inbox->read_idx, 1);
-        atomic_exchange(&header->msg_written, false);
-        atomic_exchange(&header->slot_has_data, false);
-        atomic_exchange(&header->shared, false);
-        return true;
-      }
+  uint64_t mask = atomic_load_explicit(&header->mask, __ATOMIC_RELAXED);
+  if (!(mask & X9_SHARED))
+  {
+    mask = atomic_fetch_or_explicit(&header->mask, X9_SHARED, __ATOMIC_ACQUIRE);
+    if (mask == expected)
+    {
+      memcpy(outparam, (char*)header + sizeof(x9_msg_header), msg_sz);
+      atomic_store_explicit(&header->mask, 0, __ATOMIC_RELEASE);
+      atomic_fetch_add_explicit(&inbox->read_idx, 1, __ATOMIC_RELAXED);
+      return true;
     }
-    atomic_exchange(&header->shared, false);
+    else if (!(mask & X9_SHARED))
+    {
+      atomic_fetch_and_explicit(&header->mask, ~X9_SHARED, __ATOMIC_RELAXED);
+    }
   }
   return false;
 }
@@ -388,22 +404,23 @@ bool x9_read_from_shared_inbox(x9_inbox* const inbox,
 void x9_read_from_shared_inbox_spin(x9_inbox* const inbox,
                                     uint64_t const  msg_sz,
                                     void* restrict const outparam) {
+  uint64_t expected = X9_SLOT_HAS_DATA | X9_MSG_WRITTEN;
+
   for (;;) {
-    bool                 f      = false;
     uint64_t const       idx    = x9_increment_idx(inbox, true);
     x9_msg_header* const header = x9_header_ptr(inbox, idx);
 
-    if (atomic_compare_exchange_strong(&header->shared, &f, true)) {
-      if (atomic_load(&header->slot_has_data)) {
-        if (atomic_load(&header->msg_written)) {
-          memcpy(outparam, (char*)header + sizeof(x9_msg_header), msg_sz);
-          atomic_exchange(&header->msg_written, false);
-          atomic_exchange(&header->slot_has_data, false);
-          atomic_exchange(&header->shared, false);
-          return;
-        }
-      }
-      atomic_exchange(&header->shared, false);
+    uint64_t mask = atomic_load_explicit(&header->mask, __ATOMIC_RELAXED);
+    if (mask != expected) continue;
+    mask = atomic_fetch_or_explicit(&header->mask, X9_SHARED, __ATOMIC_ACQUIRE);
+    if (mask == expected) {
+      memcpy(outparam, (char*)header + sizeof(x9_msg_header), msg_sz);
+      atomic_store_explicit(&header->mask, 0, __ATOMIC_RELEASE);
+      return;
+    }
+    else if (!(mask & X9_SHARED))
+    {
+      atomic_fetch_and_explicit(&header->mask, ~X9_SHARED, __ATOMIC_RELAXED);
     }
   }
 }
