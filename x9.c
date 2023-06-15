@@ -30,6 +30,8 @@
    You can contact the author at: diogoxflores@gmail.com
 */
 
+#pragma GCC diagnostic ignored "-Wpadded"
+
 #include "x9.h"
 
 #include <assert.h>    /* assert */
@@ -37,9 +39,13 @@
 #include <stdatomic.h> /* atomic_* */
 #include <stdbool.h>   /* bool */
 #include <stdio.h>     /* printf */
-#include <stdlib.h>    /* calloc */
+#include <stdlib.h>    /* aligned_alloc, calloc */
 #include <string.h>    /* strcmp */
 #include <string.h>    /* memcpy */
+
+/* CPU cache line size */
+#define X9_CL_SIZE       64
+#define X9_ALIGN_TO_CL() __attribute__((__aligned__(X9_CL_SIZE)))
 
 #ifdef X9_DEBUG
 static void x9_print_error_msg(char const* const error_msg) {
@@ -59,13 +65,14 @@ typedef struct {
 } x9_msg_header;
 
 typedef struct x9_inbox_internal {
-  _Atomic(uint64_t) read_idx;
-  _Atomic(uint64_t) write_idx;
-  uint64_t          sz;
-  uint64_t          msg_sz;
-  uint64_t          constant;
-  void*             msgs;
-  char*             name;
+  _Atomic(uint64_t) read_idx  X9_ALIGN_TO_CL();
+  _Atomic(uint64_t) write_idx X9_ALIGN_TO_CL();
+  uint64_t sz                 X9_ALIGN_TO_CL();
+  uint64_t                    msg_sz;
+  uint64_t                    constant;
+  void*                       msgs;
+  char*                       name;
+  char                        pad[24];
 } x9_inbox;
 
 typedef struct x9_node_internal {
@@ -106,8 +113,9 @@ x9_inbox* x9_create_inbox(uint64_t const sz,
                           uint64_t const msg_sz) {
   if (!((sz > 0) && !(sz % 2))) { goto inbox_incorrect_size; }
 
-  x9_inbox* inbox = calloc(1, sizeof(x9_inbox));
+  x9_inbox* inbox = aligned_alloc(X9_CL_SIZE, sizeof(x9_inbox));
   if (NULL == inbox) { goto inbox_allocation_failed; }
+  memset(inbox, 0, sizeof(x9_inbox));
 
   uint64_t const name_len = strlen(name);
   char*          ibx_name = calloc(name_len + 1, sizeof(char));
