@@ -35,6 +35,7 @@
 #include "x9.h"
 
 #include <assert.h>    /* assert */
+#include <immintrin.h> /* _mm_pause */
 #include <stdarg.h>    /* va_* */
 #include <stdatomic.h> /* atomic_* */
 #include <stdbool.h>   /* bool */
@@ -86,18 +87,22 @@ typedef struct x9_node_internal {
 static inline uint64_t x9_load_idx(x9_inbox* const inbox,
                                    bool const      read_idx) {
   /* From paper: Faster Remainder by Direct Computation, Lemire et al */
-  uint64_t const low_bits =
-      inbox->constant * (read_idx ? atomic_load(&inbox->read_idx)
-                                  : atomic_load(&inbox->write_idx));
+  register uint64_t const low_bits =
+      inbox->constant *
+      (read_idx ? atomic_load_explicit(&inbox->read_idx, __ATOMIC_RELAXED)
+                : atomic_load_explicit(&inbox->write_idx, __ATOMIC_RELAXED));
   return ((__uint128_t)low_bits * inbox->sz) >> 64;
 }
 
 static inline uint64_t x9_increment_idx(x9_inbox* const inbox,
                                         bool const      read_idx) {
   /* From paper: Faster Remainder by Direct Computation, Lemire et al */
-  uint64_t const low_bits =
-      inbox->constant * (read_idx ? atomic_fetch_add(&inbox->read_idx, 1)
-                                  : atomic_fetch_add(&inbox->write_idx, 1));
+  register uint64_t const low_bits =
+      inbox->constant *
+      (read_idx
+           ? atomic_fetch_add_explicit(&inbox->read_idx, 1, __ATOMIC_RELAXED)
+           : atomic_fetch_add_explicit(&inbox->write_idx, 1,
+                                       __ATOMIC_RELAXED));
   return ((__uint128_t)low_bits * inbox->sz) >> 64;
 }
 
@@ -291,14 +296,16 @@ void x9_free_node_and_attached_inboxes(x9_node* const node) {
 bool x9_write_to_inbox(x9_inbox* const inbox,
                        uint64_t const  msg_sz,
                        void const* restrict const msg) {
-  bool                 f      = false;
-  uint64_t const       idx    = x9_load_idx(inbox, false);
-  x9_msg_header* const header = x9_header_ptr(inbox, idx);
+  bool                          f      = false;
+  register uint64_t const       idx    = x9_load_idx(inbox, false);
+  register x9_msg_header* const header = x9_header_ptr(inbox, idx);
 
-  if (atomic_compare_exchange_strong(&header->slot_has_data, &f, true)) {
+  if (atomic_compare_exchange_strong_explicit(&header->slot_has_data, &f, true,
+                                              __ATOMIC_ACQUIRE,
+                                              __ATOMIC_RELAXED)) {
     memcpy((char*)header + sizeof(x9_msg_header), msg, msg_sz);
-    atomic_fetch_add(&inbox->write_idx, 1);
-    atomic_exchange(&header->msg_written, true);
+    atomic_fetch_add_explicit(&inbox->write_idx, 1, __ATOMIC_RELEASE);
+    atomic_store_explicit(&header->msg_written, true, __ATOMIC_RELEASE);
     return true;
   }
   return false;
@@ -308,13 +315,14 @@ void x9_write_to_inbox_spin(x9_inbox* const inbox,
                             uint64_t const  msg_sz,
                             void const* restrict const msg) {
   for (;;) {
-    bool                 f      = false;
-    uint64_t const       idx    = x9_increment_idx(inbox, false);
-    x9_msg_header* const header = x9_header_ptr(inbox, idx);
-
-    if (atomic_compare_exchange_strong(&header->slot_has_data, &f, true)) {
+    bool                          f      = false;
+    register uint64_t const       idx    = x9_increment_idx(inbox, false);
+    register x9_msg_header* const header = x9_header_ptr(inbox, idx);
+    if (atomic_compare_exchange_weak_explicit(&header->slot_has_data, &f, true,
+                                              __ATOMIC_ACQUIRE,
+                                              __ATOMIC_RELAXED)) {
       memcpy((char*)header + sizeof(x9_msg_header), msg, msg_sz);
-      atomic_exchange(&header->msg_written, true);
+      atomic_store_explicit(&header->msg_written, true, __ATOMIC_RELEASE);
       break;
     }
   }
@@ -331,15 +339,15 @@ void x9_broadcast_msg_to_all_node_inboxes(x9_node const* const node,
 bool x9_read_from_inbox(x9_inbox* const inbox,
                         uint64_t const  msg_sz,
                         void* restrict const outparam) {
-  uint64_t const       idx    = x9_load_idx(inbox, true);
-  x9_msg_header* const header = x9_header_ptr(inbox, idx);
+  register uint64_t const       idx    = x9_load_idx(inbox, true);
+  register x9_msg_header* const header = x9_header_ptr(inbox, idx);
 
-  if (atomic_load(&header->slot_has_data)) {
-    if (atomic_load(&header->msg_written)) {
+  if (atomic_load_explicit(&header->slot_has_data, __ATOMIC_RELAXED)) {
+    if (atomic_load_explicit(&header->msg_written, __ATOMIC_ACQUIRE)) {
       memcpy(outparam, (char*)header + sizeof(x9_msg_header), msg_sz);
-      atomic_exchange(&header->msg_written, false);
-      atomic_exchange(&header->slot_has_data, false);
-      atomic_fetch_add(&inbox->read_idx, 1);
+      atomic_store_explicit(&header->msg_written, false, __ATOMIC_RELAXED);
+      atomic_store_explicit(&header->slot_has_data, false, __ATOMIC_RELEASE);
+      atomic_fetch_add_explicit(&inbox->read_idx, 1, __ATOMIC_RELEASE);
       return true;
     }
   }
@@ -349,15 +357,16 @@ bool x9_read_from_inbox(x9_inbox* const inbox,
 void x9_read_from_inbox_spin(x9_inbox* const inbox,
                              uint64_t const  msg_sz,
                              void* restrict const outparam) {
-  uint64_t const       idx    = x9_increment_idx(inbox, true);
-  x9_msg_header* const header = x9_header_ptr(inbox, idx);
+  register uint64_t const       idx    = x9_increment_idx(inbox, true);
+  register x9_msg_header* const header = x9_header_ptr(inbox, idx);
 
   for (;;) {
-    if (atomic_load(&header->slot_has_data)) {
-      if (atomic_load(&header->msg_written)) {
+    _mm_pause();
+    if (atomic_load_explicit(&header->slot_has_data, __ATOMIC_RELAXED)) {
+      if (atomic_load_explicit(&header->msg_written, __ATOMIC_ACQUIRE)) {
         memcpy(outparam, (char*)header + sizeof(x9_msg_header), msg_sz);
-        atomic_exchange(&header->msg_written, false);
-        atomic_exchange(&header->slot_has_data, false);
+        atomic_store_explicit(&header->msg_written, false, __ATOMIC_RELAXED);
+        atomic_store_explicit(&header->slot_has_data, false, __ATOMIC_RELEASE);
         return;
       }
     }
@@ -367,22 +376,23 @@ void x9_read_from_inbox_spin(x9_inbox* const inbox,
 bool x9_read_from_shared_inbox(x9_inbox* const inbox,
                                uint64_t const  msg_sz,
                                void* restrict const outparam) {
-  bool                 f      = false;
-  uint64_t const       idx    = x9_load_idx(inbox, true);
-  x9_msg_header* const header = x9_header_ptr(inbox, idx);
+  bool                          f      = false;
+  register uint64_t const       idx    = x9_load_idx(inbox, true);
+  register x9_msg_header* const header = x9_header_ptr(inbox, idx);
 
-  if (atomic_compare_exchange_strong(&header->shared, &f, true)) {
-    if (atomic_load(&header->slot_has_data)) {
-      if (atomic_load(&header->msg_written)) {
+  if (atomic_compare_exchange_strong_explicit(
+          &header->shared, &f, true, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+    if (atomic_load_explicit(&header->slot_has_data, __ATOMIC_RELAXED)) {
+      if (atomic_load_explicit(&header->msg_written, __ATOMIC_ACQUIRE)) {
         memcpy(outparam, (char*)header + sizeof(x9_msg_header), msg_sz);
-        atomic_fetch_add(&inbox->read_idx, 1);
-        atomic_exchange(&header->msg_written, false);
-        atomic_exchange(&header->slot_has_data, false);
-        atomic_exchange(&header->shared, false);
+        atomic_fetch_add_explicit(&inbox->read_idx, 1, __ATOMIC_RELEASE);
+        atomic_store_explicit(&header->msg_written, false, __ATOMIC_RELAXED);
+        atomic_store_explicit(&header->slot_has_data, false, __ATOMIC_RELEASE);
+        atomic_store_explicit(&header->shared, false, __ATOMIC_RELEASE);
         return true;
       }
     }
-    atomic_exchange(&header->shared, false);
+    atomic_store_explicit(&header->shared, false, __ATOMIC_RELEASE);
   }
   return false;
 }
@@ -391,21 +401,23 @@ void x9_read_from_shared_inbox_spin(x9_inbox* const inbox,
                                     uint64_t const  msg_sz,
                                     void* restrict const outparam) {
   for (;;) {
-    bool                 f      = false;
-    uint64_t const       idx    = x9_increment_idx(inbox, true);
-    x9_msg_header* const header = x9_header_ptr(inbox, idx);
+    bool                          f      = false;
+    register uint64_t const       idx    = x9_increment_idx(inbox, true);
+    register x9_msg_header* const header = x9_header_ptr(inbox, idx);
 
-    if (atomic_compare_exchange_strong(&header->shared, &f, true)) {
-      if (atomic_load(&header->slot_has_data)) {
-        if (atomic_load(&header->msg_written)) {
+    if (atomic_compare_exchange_strong_explicit(
+            &header->shared, &f, true, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      if (atomic_load_explicit(&header->slot_has_data, __ATOMIC_RELAXED)) {
+        if (atomic_load_explicit(&header->msg_written, __ATOMIC_ACQUIRE)) {
           memcpy(outparam, (char*)header + sizeof(x9_msg_header), msg_sz);
-          atomic_exchange(&header->msg_written, false);
-          atomic_exchange(&header->slot_has_data, false);
-          atomic_exchange(&header->shared, false);
+          atomic_store_explicit(&header->msg_written, false, __ATOMIC_RELAXED);
+          atomic_store_explicit(&header->slot_has_data, false,
+                                __ATOMIC_RELEASE);
+          atomic_store_explicit(&header->shared, false, __ATOMIC_RELEASE);
           return;
         }
       }
-      atomic_exchange(&header->shared, false);
+      atomic_store_explicit(&header->shared, false, __ATOMIC_RELEASE);
     }
   }
 }
