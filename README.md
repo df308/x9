@@ -3,7 +3,7 @@ X9
 
 *Note: I am currently working on v2.0 which will bring further performance 
 gains and flexibility to the user at the (unfortunate) cost of breaking the 
-current API. I expect to release v2.0 by September 2023 and for it to be the 
+current API. I expect to release v2.0 by September/October 2024 and for it to be the 
 last major/API-breaking change to X9.*
 
 X9 is a low level high performance message passing library, based on a
